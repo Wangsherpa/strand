@@ -1,0 +1,33 @@
+# Byte-compiled
+__pycache__/
+*.py[cod]
+
+# Distribution
+build/
+dist/
+*.egg-info/
+
+# Virtual environment
+.venv/
+
+# Environment (API keys)
+.env
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+*.swp
+*.swo
+
+# Mypy
+.mypy_cache/
+
+# Test artifacts
+.coverage
+htmlcov/
+.pytest_cache/
