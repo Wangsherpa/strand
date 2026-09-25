@@ -7,5 +7,29 @@ requires-python = ">=3.13"
 dependencies = [
     "pydantic>=2.13.4",
     "python-dotenv>=1.2.2",
-    "requests>=2.34.2",
+    "httpx>=0.27",
 ]
+
+[dependency-groups]
+dev = [
+    "jupyter>=1.1.1",
+    "notebook>=7.6.3",
+    "pytest>=8.4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Make `tests.helpers` importable regardless of how pytest is invoked
+# (`pytest` vs `python -m pytest` — only the latter puts the repo root
+# on sys.path itself).
+pythonpath = ["."]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# Flat layout: the strand package IS the repo root (__init__.py, core/, llm/,
+# trace/ at its top level), so map the "strand" package to ".".
+[tool.setuptools]
+package-dir = { "strand" = "." }
+packages = ["strand", "strand.core", "strand.llm", "strand.trace"]
