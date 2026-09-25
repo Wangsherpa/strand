@@ -1,10 +1,13 @@
 """Task context — the shared state bus passed between workflow nodes."""
 
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from pydantic import BaseModel, Field, PrivateAttr
 
 from strand.core.run_context import RunContext
+
+if TYPE_CHECKING:
+    from strand.core.schema import NodeConfig
 
 
 class TaskContext(BaseModel):
@@ -28,10 +31,11 @@ class TaskContext(BaseModel):
     ``event``, ``nodes``, ``metadata``, ``should_stop``, and ``errors``
     are domain data — free for node authors to read and write, and safe
     to serialize (``model_dump()``). Engine bookkeeping (identity,
-    versioning, the resolved node-config map, the traversal log) lives
+    versioning, the resolved node-config map, listeners) lives
     separately in a private ``RunContext``, set by ``Workflow`` and
-    never included in serialization. Use the ``execution_id`` /
-    ``workflow_version`` properties for the one piece of that domain
+    excluded from pickling/deepcopy (see ``__getstate__``). Use the
+    ``execution_id`` / ``workflow_version`` properties and
+    ``get_node_config()`` for the pieces of that bookkeeping domain
     code is meant to read.
     """
 
@@ -71,6 +75,72 @@ class TaskContext(BaseModel):
         Once called, the execution loop will not advance to the next node.
         """
         self.should_stop = True
+
+    def get_node_config(self, key: str) -> Optional["NodeConfig"]:
+        """The currently-executing workflow's ``NodeConfig`` for *key*.
+
+        ``None`` outside a workflow run, or for keys without a config
+        (e.g. implicit terminal nodes). This is the sanctioned read
+        surface for domain code that needs graph knowledge — the
+        pre-RunContext convention of publishing the whole config map
+        under ``metadata["nodes"]`` was engine bookkeeping and is no
+        longer written there.
+        """
+        run = self._run_context
+        if run is None:
+            return None
+        return run.node_configs.get(key)
+
+    def __getstate__(self) -> Dict[str, Any]:
+        """Exclude engine bookkeeping from pickling/deepcopy.
+
+        ``RunContext`` (and everything it references — listeners, node
+        configs) is run-scoped: it is never serialized with domain data
+        and is not re-installed on unpickle. This is what the class
+        docstring's "excluded from pickling/deepcopy" promise refers to.
+        """
+        state = super().__getstate__()
+        # pydantic stores private attrs under "__pydantic_private__" (a
+        # flat key is tolerated too, in case that layout ever changes).
+        # The key is KEPT but its value replaced with None: the RunContext
+        # itself — listeners, node configs — never enters the pickle
+        # graph, and the unpickled context is cleanly "outside a run"
+        # (its execution_id/workflow_version read as None).
+        private = state.get("__pydantic_private__")
+        if isinstance(private, dict):
+            private["_run_context"] = None
+        elif "_run_context" in state:
+            state["_run_context"] = None
+        return state
+
+    def __deepcopy__(self, memo: Optional[Dict[int, Any]] = None) -> "TaskContext":
+        """Deep-copy without the engine's RunContext.
+
+        Mirrors pydantic's own ``__deepcopy__`` (which does not go
+        through ``__getstate__`` and would otherwise carry the
+        RunContext — listeners, node configs and all — into the copy),
+        but replaces ``_run_context`` with ``None``: the copy is cleanly
+        "outside a run", exactly like an unpickled context.
+        """
+        from copy import deepcopy as _deepcopy
+
+        cls = type(self)
+        new = cls.__new__(cls)
+        if memo is not None:
+            memo[id(self)] = new
+        object.__setattr__(new, "__dict__", _deepcopy(self.__dict__, memo))
+        object.__setattr__(
+            new, "__pydantic_extra__",
+            _deepcopy(getattr(self, "__pydantic_extra__", None), memo),
+        )
+        object.__setattr__(new, "__pydantic_fields_set__", set(self.__pydantic_fields_set__))
+        private = getattr(self, "__pydantic_private__", None) or {}
+        copied_private = _deepcopy(
+            {key: value for key, value in private.items() if key != "_run_context"}, memo
+        )
+        copied_private["_run_context"] = None
+        object.__setattr__(new, "__pydantic_private__", copied_private)
+        return new
 
     @property
     def execution_id(self) -> Optional[str]:

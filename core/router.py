@@ -102,9 +102,16 @@ class BaseRouter(Node):
         # place, so without per-instance copies, two BaseRouter
         # instances of the same class (e.g. two concurrent runs, or the
         # same class registered under two registry keys) would stomp on
-        # each other's in-flight task_context. Shallow-copying each rule
-        # here gives every router instance its own independent set.
-        self.routes = [copy.copy(rule) for rule in type(self).routes]
+        # each other's in-flight task_context. Copying each rule here
+        # gives every router instance its own independent set.
+        #
+        # The source list is `self.routes`, NOT `type(self).routes`: a
+        # subclass may assign its own routes on the instance before
+        # calling super().__init__(), and reading the class attribute
+        # would silently discard them. The copy is deep: a rule instance
+        # may itself hold mutable state (a seen-set, counters) that a
+        # shallow copy would still share across routers and runs.
+        self.routes = [copy.deepcopy(rule) for rule in self.routes]
         self.last_matched_rule: Optional[str] = None
 
     async def process(self, task_context: TaskContext) -> TaskContext:

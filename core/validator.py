@@ -1,7 +1,7 @@
 """Workflow validator — ensures a workflow schema is a valid DAG."""
 
 from collections import deque
-from typing import Optional, Set
+from typing import List, Optional, Set
 
 from strand.core.router import BaseRouter
 from strand.core.schema import NodeConfig, WorkflowSchema
@@ -14,8 +14,10 @@ class WorkflowValidator:
 
     1. **Registry integrity** — every string key referenced by the schema
        exists in ``registry``.
-    2. **DAG structure** — the graph contains no cycles and all nodes are
-       reachable from the start node.
+    2. **DAG structure** — the graph contains no cycles (through
+       ``connections`` *or* ``on_error`` edges — an error handler that
+       routes back into its own path would loop forever at runtime) and
+       all nodes are reachable from the start node.
     3. **Connection rules** — only nodes marked ``is_router`` may have
        multiple outgoing connections.
     4. **Router flag consistency** — ``is_router`` must agree with
@@ -94,7 +96,7 @@ class WorkflowValidator:
 
             nc = self._get_config(key)
             if nc is not None:
-                for neighbor in nc.connections:
+                for neighbor in self._neighbors(nc):
                     if neighbor not in visited:
                         if _dfs(neighbor):
                             return True
@@ -198,6 +200,19 @@ class WorkflowValidator:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _neighbors(nc: NodeConfig) -> List[str]:
+        """Every key execution can jump to from *nc*.
+
+        ``on_error`` is just another way execution can move to a node,
+        so cycle detection must follow it alongside ``connections`` — a
+        node whose error handler (possibly itself) routes back into its
+        own path would otherwise loop forever at runtime.
+        """
+        if nc.on_error is not None:
+            return list(nc.connections) + [nc.on_error]
+        return list(nc.connections)
 
     def _get_config(self, key: str) -> Optional[NodeConfig]:
         """Return the ``NodeConfig`` for *key*, or ``None``."""

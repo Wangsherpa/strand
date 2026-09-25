@@ -9,7 +9,7 @@
 | Package | Purpose | Dependencies |
 |---|---|---|
 | `strand.core` | Represent, validate, and execute DAG workflows | `pydantic` |
-| `strand.llm` | Reusable LLM node base class with multi-provider dispatch | `pydantic`, `requests`, `litellm` (optional) |
+| `strand.llm` | Reusable LLM node base class with multi-provider dispatch | `pydantic`, `httpx`, `litellm` (optional) |
 
 Neither package depends on FastAPI, Celery, databases, or any AI SDK.
 
@@ -90,10 +90,10 @@ class SummarizeNode(LLMNode):
 ### Switching LLM providers
 
 ```python
-# OpenAI (lightweight — uses requests, no extra deps)
+# OpenAI (lightweight — uses httpx, no extra deps)
 LLMConfig(model="gpt-4o-mini", provider="openai")
 
-# Anthropic (lightweight — uses requests, no extra deps)
+# Anthropic (lightweight — uses httpx, no extra deps)
 LLMConfig(model="claude-sonnet-4-6", provider="anthropic")
 
 # LiteLLM (100+ providers, built-in retry/fallback, cost tracking)
@@ -110,9 +110,9 @@ LLMConfig(model="llama3.2", provider="openai", base_url="http://localhost:11434/
 
 | Provider | Backend | Structured output | Retry | Dependencies |
 |---|---|---|---|---|
-| `openai` | Direct HTTP (`requests`) | Native `json_schema` | Manual | `requests` |
-| `anthropic` | Direct HTTP (`requests`) | Prompted JSON | Manual | `requests` |
-| `litellm` | LiteLLM library | Auto-translated per provider | Built-in (`num_retries`, `fallbacks`) | `litellm` |
+| `openai` | Direct HTTP (`httpx`) | Native `json_schema` | Automatic (default policy) | `httpx` |
+| `anthropic` | Direct HTTP (`httpx`) | Prompted JSON | Automatic (default policy) | `httpx` |
+| `litellm` | LiteLLM library | Auto-translated per provider | Automatic (default policy) | `litellm` |
 
 **When to use which:**
 
@@ -217,7 +217,7 @@ WorkflowSchema(
 | `LLMConfig` | Dataclass: model, provider, temperature, API key, base URL |
 | `ModelProvider` | Enum: `openai`, `anthropic`, `litellm` (extensible) |
 | `LLMNode(Node)` | Base class — implement `get_llm_config()` and `build_user_message()` |
-| `call_llm()` | Low-level dispatch function for direct API calls |
+| `call_llm()` | Low-level async dispatch — returns an `LLMResult` (await it, or wrap in `asyncio.run()`) |
 
 **Key design choice:** `LLMNode` extends `strand.core.Node` from *outside* the core package. `strand.core` knows nothing about LLMs. The LLM integration is a separate concern in `strand.llm`.
 
@@ -253,7 +253,7 @@ WorkflowSchema(
 │      depends on:                             │
 │        strand.core                           │
 │        pydantic                              │
-│        requests                              │
+│        httpx                                 │
 │        litellm (optional)                    │
 └──────────────────────────────────────────────┘
 ```
@@ -280,6 +280,54 @@ Shape conventions:
 
 ---
 
+## Retry, timeouts & error routing
+
+Every `NodeConfig` accepts:
+
+- `retry` — a `RetryPolicy` (`max_attempts` including the first, exponential
+  backoff, jitter, and a `retry_on` exception type / tuple / predicate).
+  Defaults to no retry.
+- `timeout_s` — per-attempt timeout (a timeout is just another failure:
+  `retry_on` decides whether it is retried).
+- `on_error` — a registry key to route to when retries are exhausted, instead of
+  aborting the run. The failing node's error summary lands in
+  `ctx.errors[node]`, readable via `Node.get_error(node)`.
+
+```python
+NodeConfig(
+    node="classify",
+    retry=RetryPolicy(max_attempts=3, backoff_base=1.0, retry_on=(ValueError,)),
+    timeout_s=30.0,
+    on_error="fallback_handler",
+)
+```
+
+For LLM nodes, `LLMConfig.retry` (or a per-provider default of 3 attempts) handles
+transient transport failures, and `max_output_repair_attempts` asks the model to
+fix responses that failed to parse or validate. `RetryPolicy.max_attempts` bounds
+the TOTAL provider calls, repair attempts included. When a node's `NodeConfig.retry`
+is set, the engine owns retries for that node and the LLM layer's transport retry
+is disabled for its calls — the two layers never multiply.
+
+---
+
+## Observability
+
+Pass `WorkflowListener` instances to `Workflow(listeners=[...])` to observe runs:
+
+- `on_workflow_start` / `on_workflow_end` — around each (possibly nested) workflow
+- `on_node_start` / `on_node_end` / `on_node_error` — per node attempt, with real
+  attempt numbers, retry decisions, and durations
+- `on_route` — every router decision
+
+Hooks may be sync or async; a raising listener is logged and never affects the
+run. Nested workflows inherit the outermost listeners under one `execution_id`.
+`strand.trace` ships two reference listeners: `InMemoryCollector` (assembles
+`ExecutionRecord`s for tests and debugging) and `JsonlWriter` (one JSON line per
+event, for tailing a live run).
+
+---
+
 ## Package Structure
 
 ```
@@ -287,26 +335,37 @@ strand/
     __init__.py
 
     core/                    # DAG execution engine
-        __init__.py          #   9 public exports
+        __init__.py          #   12 public exports
         context.py           #   TaskContext
         node.py              #   Node (ABC)
         registry.py          #   NodeRegistry type alias
+        retry.py             #   RetryPolicy
+        listener.py          #   WorkflowListener + shared dispatch
+        run_context.py       #   RunContext (engine bookkeeping)
         router.py            #   BaseRouter, RouterNode
         schema.py            #   NodeConfig, WorkflowSchema
         validator.py         #   WorkflowValidator
         workflow.py          #   Workflow
 
     llm/                     # LLM integration layer
-        __init__.py          #   4 public exports
+        __init__.py          #   6 public exports
         config.py            #   LLMConfig, ModelProvider
         client.py            #   Provider dispatch (openai, anthropic, litellm)
         node.py              #   LLMNode(Node)
+        listener.py          #   LLMListener
+        result.py            #   LLMResult
+        retry_defaults.py    #   per-provider default RetryPolicy
+
+    trace/                   # optional reference listeners
+        __init__.py          #   InMemoryCollector, JsonlWriter, ExecutionRecord
+        collectors.py        #   the two reference listeners
+        models.py            #   ExecutionRecord, NodeSpan, RouteDecision
 ```
 
 | Module | LOC | Dependencies |
 |---|---|---|
 | `strand/core/` | 741 | `pydantic` |
-| `strand/llm/` | 293 | `pydantic`, `requests`, `strand.core` |
+| `strand/llm/` | 293 | `pydantic`, `httpx`, `strand.core` |
 | **Total** | **1,034** | |
 
 ---
@@ -316,9 +375,9 @@ strand/
 - **Not an HTTP server** — no FastAPI, Flask, or Starlette
 - **Not a task queue** — no Celery, RQ, or ARQ
 - **Not a database** — no SQLAlchemy, Alembic, or ORM
-- **Not an AI SDK** — no required dependency on OpenAI SDK, Anthropic SDK, or pydantic-ai. The `openai` and `anthropic` providers use plain `requests`. The `litellm` provider is optional.
+- **Not an AI SDK** — no required dependency on OpenAI SDK, Anthropic SDK, or pydantic-ai. The `openai` and `anthropic` providers use plain `httpx`. The `litellm` provider is optional.
 - **Not a prompt manager** — no Jinja2 templates or prompt loaders
-- **Not an observability platform** — no Langfuse, OpenTelemetry
+- **Not an observability platform** — no Langfuse/OpenTelemetry integration, but `WorkflowListener` hooks (plus the `strand.trace` reference listeners) give you the events to build one
 - **Not a deployment tool** — no Docker, Kubernetes, or cloud configs
 
 These belong in your application layer. Strand is the engine — you build the car around it.

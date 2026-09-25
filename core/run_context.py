@@ -3,8 +3,7 @@
 Unlike ``TaskContext`` (domain data: ``event``, ``nodes``, ``metadata``),
 ``RunContext`` holds framework internals that domain code should not
 see or mutate directly: identity, versioning, timing, the resolved
-node-config map used for traversal, and — from later phases — listener
-registration and the executed-edge trace.
+node-config map used for traversal, and listener registration.
 
 Never passed to nodes directly. ``TaskContext.execution_id`` /
 ``TaskContext.workflow_version`` are the sanctioned read-only surface
@@ -40,8 +39,14 @@ class RunContext:
             Shared with nested children (plus any they register of
             their own) so a listener registered on the root observes
             every nested workflow's node executions too.
-        traversal: Registry keys actually visited, in order, for this
-            workflow's own execution (not its children's).
+        finished: True once this workflow's own traversal has completed
+            (successfully or not). The engine marks the top-level run
+            finished on exit but leaves it installed on the
+            ``TaskContext`` (so ``execution_id``/``workflow_version``
+            stay readable from the result) — ``Workflow._execute`` uses
+            this flag to tell "nested child of a still-running parent"
+            (inherit identity/listeners) apart from "a context left
+            over from a previous run" (mint a fresh execution instead).
     """
 
     execution_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -50,7 +55,7 @@ class RunContext:
     workflow_version: Optional[str] = None
     node_configs: Dict[str, Any] = field(default_factory=dict)
     listeners: List[Any] = field(default_factory=list)
-    traversal: List[str] = field(default_factory=list)
+    finished: bool = False
 
     @classmethod
     def child_of(
@@ -76,7 +81,9 @@ class RunContext:
 
         When *parent* is ``None`` (a fresh top-level run), a new
         ``execution_id`` and ``started_at`` are minted, and
-        ``listeners`` is just ``own_listeners``.
+        ``listeners`` is just ``own_listeners``. The caller must pass
+        ``None`` for a *finished* parent (a context left over from a
+        previous run) — ``Workflow._execute`` does this check itself.
         """
         own_listeners = list(own_listeners) if own_listeners else []
         if parent is None:

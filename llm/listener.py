@@ -1,24 +1,22 @@
 """LLMListener — LLM-specific observability, composed alongside
 strand.core's WorkflowListener rather than living on it.
 
-Decided in Phase 5, before this protocol existed: strand.core's
-WorkflowListener stays purely graph-shaped, with no LLM vocabulary in
-its signatures. A consumer that wants both graph-level and LLM-level
-tracing implements both protocols on one class — nothing here requires
-subclassing either one specifically, since dispatch is duck-typed
-(matching strand.core's own WorkflowListener dispatch).
+strand.core's WorkflowListener stays purely graph-shaped, with no LLM
+vocabulary in its signatures. A consumer that wants both graph-level
+and LLM-level tracing implements both protocols on one class — nothing
+here requires subclassing either one specifically, since dispatch is
+duck-typed and shared with strand.core's own dispatch.
 """
 
 from __future__ import annotations
 
-import logging
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Optional
+
+from strand.core.listener import notify_listeners
 
 if TYPE_CHECKING:
     from strand.core.run_context import RunContext
     from strand.llm.result import LLMResult
-
-logger = logging.getLogger(__name__)
 
 
 class LLMListener:
@@ -50,28 +48,18 @@ class LLMListener:
         """
 
 
-def notify_llm_call(
+async def notify_llm_call(
     run: Optional["RunContext"],
     node_id: str,
     result: Optional["LLMResult"],
     error: Optional[BaseException],
 ) -> None:
     """Dispatch ``on_llm_call`` to every registered listener that
-    implements it, defensively — mirrors
-    ``strand.core.Workflow._notify``'s guarantee that a raising
-    listener never affects the node's own outcome. Not shared code
-    with strand.core by design: strand.core doesn't know LLMListener
-    exists, and shouldn't need to.
+    implements it, defensively.
+
+    Delegates to strand.core's shared ``notify_listeners`` — the one
+    place the swallow-and-log guarantee (and sync/async hook support)
+    is enforced — while strand.core itself still knows nothing about
+    LLMListener.
     """
-    if run is None:
-        return
-    for listener in run.listeners:
-        method = getattr(listener, "on_llm_call", None)
-        if method is None:
-            continue
-        try:
-            method(run, node_id, result, error)
-        except Exception:
-            logger.exception(
-                "Listener %r raised in on_llm_call() — ignoring.", listener
-            )
+    await notify_listeners(run, "on_llm_call", node_id, result, error)

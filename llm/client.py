@@ -10,14 +10,15 @@ transport retry (rate limits, connection errors, 5xx — see
 ``strand.llm.retry_defaults``) and structured-output repair (a
 response that came back but failed to parse or validate). Both count
 toward ``LLMResult.attempts``; only the second sets
-``validation_repaired``.
+``validation_repaired``. ``RetryPolicy.max_attempts`` bounds the
+TOTAL number of provider calls, repair attempts included — the two
+budgets compose instead of multiplying.
 
 ``call_llm()`` is a coroutine — openai/anthropic go over
-``httpx.AsyncClient``, litellm via ``litellm.acompletion`` — so an
+``httpx.AsyncClient`` (one client reused across every retry/repair
+attempt of a call), litellm via ``litellm.acompletion`` — so an
 LLM-heavy workflow doesn't block the event loop for every call's
-network round-trip (Phase 8; Phase 7 shipped a synchronous version
-built on ``requests``, fine for a serial batch job but a regression
-for any concurrent/service-shaped consumer).
+network round-trip.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Dict, Optional
 
 import httpx
@@ -36,10 +38,7 @@ from strand.llm.config import LLMConfig, ModelProvider
 from strand.llm.result import LLMResult
 
 # Indirection so tests can replace the sleep used for retry backoff
-# without monkeypatching the shared, global asyncio.sleep — mirrors
-# strand.core.workflow._sleep's own reasoning (Phase 6), now that
-# call_llm is itself a coroutine (Phase 8) rather than a blocking
-# synchronous call.
+# without monkeypatching the shared, global asyncio.sleep.
 _sleep = asyncio.sleep
 
 
@@ -104,8 +103,12 @@ async def call_llm(
     Retries transient transport failures per ``config.retry`` (or a
     per-provider default when unset), and makes up to
     ``config.max_output_repair_attempts`` attempts to have the model
-    fix a response that failed to parse or validate — both count
-    toward the returned ``LLMResult.attempts``.
+    fix a response that failed to parse or validate. Every provider
+    call — transport attempts and repair attempts alike — counts
+    toward ``RetryPolicy.max_attempts``: the total number of provider
+    calls per ``call_llm()`` is always bounded by it.
+
+    ``asyncio.CancelledError`` is re-raised immediately, never retried.
 
     Args:
         config: Provider, model, temperature, and credentials.
@@ -131,48 +134,61 @@ async def call_llm(
     started = time.monotonic()
     attempt = 0
 
-    while True:
-        attempt += 1
-        try:
-            if provider == ModelProvider.OPENAI.value:
-                raw = await _call_openai(config, current_user_message, output_model)
-            elif provider == ModelProvider.ANTHROPIC.value:
-                raw = await _call_anthropic(config, current_user_message, output_model)
-            elif provider == ModelProvider.LITELLM.value:
-                raw = await _call_litellm(config, current_user_message, output_model)
-            else:
-                raise ValueError(f"Unsupported provider: {config.provider}")
-        except BaseException as exc:
-            if retry_policy.should_retry(exc, attempt):
-                await _sleep(retry_policy.backoff_seconds(attempt))
-                continue
-            raise
+    # One client per call, reused across every retry and repair attempt —
+    # the connection pool stays warm instead of paying a fresh TCP+TLS
+    # handshake per attempt.
+    async with httpx.AsyncClient() as client:
+        while True:
+            attempt += 1
+            try:
+                if provider == ModelProvider.OPENAI.value:
+                    raw = await _call_openai(config, current_user_message, output_model, client)
+                elif provider == ModelProvider.ANTHROPIC.value:
+                    raw = await _call_anthropic(config, current_user_message, output_model, client)
+                elif provider == ModelProvider.LITELLM.value:
+                    raw = await _call_litellm(config, current_user_message, output_model)
+                else:
+                    raise ValueError(f"Unsupported provider: {config.provider}")
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                if retry_policy.should_retry(exc, attempt):
+                    await _sleep(retry_policy.backoff_seconds(attempt))
+                    continue
+                raise
 
-        try:
-            parsed = output_model.model_validate(json.loads(raw.text))
-        except (json.JSONDecodeError, ValidationError) as exc:
-            if repair_attempts_left > 0:
-                repair_attempts_left -= 1
-                validation_repaired = True
-                current_user_message = _build_repair_message(
-                    user_message, raw.text, exc
-                )
-                continue
-            raise
+            try:
+                # `or ""` so a null content (content-filter refusals,
+                # tool-call-only replies) parses as invalid JSON and
+                # reaches the repair path, instead of raising a TypeError
+                # outside every guard.
+                parsed = output_model.model_validate(json.loads(raw.text or ""))
+            except (json.JSONDecodeError, ValidationError) as exc:
+                if (
+                    repair_attempts_left > 0
+                    and attempt < retry_policy.max_attempts
+                ):
+                    repair_attempts_left -= 1
+                    validation_repaired = True
+                    current_user_message = _build_repair_message(
+                        user_message, raw.text or "", exc
+                    )
+                    continue
+                raise
 
-        latency_ms = (time.monotonic() - started) * 1000
-        return LLMResult(
-            parsed=parsed,
-            raw_text=raw.text,
-            provider=provider,
-            model=config.model,
-            input_tokens=raw.input_tokens,
-            output_tokens=raw.output_tokens,
-            latency_ms=latency_ms,
-            attempts=attempt,
-            finish_reason=raw.finish_reason,
-            validation_repaired=validation_repaired,
-        )
+            latency_ms = (time.monotonic() - started) * 1000
+            return LLMResult(
+                parsed=parsed,
+                raw_text=raw.text,
+                provider=provider,
+                model=config.model,
+                input_tokens=raw.input_tokens,
+                output_tokens=raw.output_tokens,
+                latency_ms=latency_ms,
+                attempts=attempt,
+                finish_reason=raw.finish_reason,
+                validation_repaired=validation_repaired,
+            )
 
 
 # ===================================================================
@@ -188,9 +204,7 @@ def _ensure_strict(schema: dict) -> None:
     Pydantic v2 emits nested BaseModel fields as ``$ref`` pointers into
     a top-level ``$defs`` section rather than inlining them, so a walk
     that only follows ``properties``/``anyOf`` never reaches those
-    definitions. Fixed here by also recursing into ``$defs`` — found
-    while building strand's own test suite (Phase 1), not previously
-    documented.
+    definitions. Fixed here by also recursing into ``$defs``.
     """
     if schema.get("type") == "object":
         schema["additionalProperties"] = False
@@ -211,27 +225,54 @@ _OPENAI_DEFAULT_BASE = "https://api.openai.com/v1"
 _OPENAI_CHAT_PATH = "/chat/completions"
 
 
+@lru_cache(maxsize=None)
+def _strict_schema(output_model: type[BaseModel]) -> dict:
+    """``model_json_schema()`` with strict-mode additions, memoized per
+    model — the schema is constant for a given ``output_model``, and
+    rebuilding it (plus the ``_ensure_strict`` walk) on every attempt
+    and repair was wasted work. Callers must not mutate the returned
+    dict.
+    """
+    json_schema = output_model.model_json_schema()
+    _ensure_strict(json_schema)
+    return json_schema
+
+
+def _strict_response_format(output_model: type[BaseModel]) -> Dict[str, Any]:
+    """The OpenAI/LiteLLM ``response_format`` block requesting native
+    strict structured output for *output_model*."""
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": output_model.__name__,
+            "strict": True,
+            "schema": _strict_schema(output_model),
+        },
+    }
+
+
 def _openai_url(config: LLMConfig) -> str:
     """Build the chat-completions URL from a *base*, per the OpenAI SDK's
     own convention: base_url includes the ``/v1`` segment, and only
     ``/chat/completions`` is appended — matching Ollama, vLLM, LocalAI,
     and every other OpenAI-compatible proxy's expected base_url shape
     (e.g. ``http://localhost:11434/v1``, this README's own Ollama
-    example). Appending a hardcoded ``/v1/chat/completions`` instead
-    would double up the ``/v1`` for any base_url following that
-    convention — caught before shipping by re-checking the README
-    example this fix was meant to satisfy, not by a failing test.
+    example). A value that already ends with the path (a full endpoint,
+    the pre-httpx convention) is used verbatim instead of doubled.
     """
-    base = (config.base_url or _OPENAI_DEFAULT_BASE).rstrip("/")
-    return f"{base}{_OPENAI_CHAT_PATH}"
+    url = (config.base_url or _OPENAI_DEFAULT_BASE).rstrip("/")
+    if not url.endswith(_OPENAI_CHAT_PATH):
+        url += _OPENAI_CHAT_PATH
+    return url
 
 
 async def _call_openai(
-    config: LLMConfig, user_message: str, output_model: type[BaseModel]
+    config: LLMConfig,
+    user_message: str,
+    output_model: type[BaseModel],
+    client: httpx.AsyncClient,
 ) -> _RawResponse:
     api_key = config.api_key or os.getenv("OPENAI_API_KEY")
-    json_schema = output_model.model_json_schema()
-    _ensure_strict(json_schema)
 
     payload: Dict[str, Any] = {
         "model": config.model,
@@ -239,24 +280,16 @@ async def _call_openai(
             {"role": "system", "content": config.system_prompt},
             {"role": "user", "content": user_message},
         ],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": output_model.__name__,
-                "strict": True,
-                "schema": json_schema,
-            },
-        },
+        "response_format": _strict_response_format(output_model),
         "temperature": config.temperature,
     }
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            _openai_url(config),
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=config.timeout_s,
-        )
+    resp = await client.post(
+        _openai_url(config),
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=config.timeout_s,
+    )
     resp.raise_for_status()
     body = resp.json()
     choice = body["choices"][0]
@@ -279,15 +312,30 @@ _ANTHROPIC_PATH = "/v1/messages"
 
 
 def _anthropic_url(config: LLMConfig) -> str:
-    base = (config.base_url or _ANTHROPIC_DEFAULT_BASE).rstrip("/")
-    return f"{base}{_ANTHROPIC_PATH}"
+    url = (config.base_url or _ANTHROPIC_DEFAULT_BASE).rstrip("/")
+    if not url.endswith(_ANTHROPIC_PATH):
+        url += _ANTHROPIC_PATH
+    return url
+
+
+def _strip_endpoint_path(url: str) -> str:
+    """Undo a full-endpoint URL back to a base — litellm's ``api_base``
+    expects the base (it appends the provider path itself), so a
+    base_url given as a full endpoint must not reach it verbatim."""
+    for path in (_OPENAI_CHAT_PATH, _ANTHROPIC_PATH):
+        if url.endswith(path):
+            return url[: -len(path)].rstrip("/")
+    return url
 
 
 async def _call_anthropic(
-    config: LLMConfig, user_message: str, output_model: type[BaseModel]
+    config: LLMConfig,
+    user_message: str,
+    output_model: type[BaseModel],
+    client: httpx.AsyncClient,
 ) -> _RawResponse:
     api_key = config.api_key or os.getenv("ANTHROPIC_API_KEY")
-    json_schema = output_model.model_json_schema()
+    json_schema = _strict_schema(output_model)
 
     # Anthropic doesn't have native structured-output mode — we embed
     # the expected JSON schema in the system prompt.
@@ -307,23 +355,26 @@ async def _call_anthropic(
         "temperature": config.temperature,
     }
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            _anthropic_url(config),
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=config.timeout_s,
-        )
+    resp = await client.post(
+        _anthropic_url(config),
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=config.timeout_s,
+    )
     resp.raise_for_status()
     body = resp.json()
     usage = body.get("usage") or {}
 
-    # Anthropic returns text; strip markdown code fences if present.
-    raw = body["content"][0]["text"]
+    # Anthropic returns text; a tool_use-only reply has no text block —
+    # treat missing/null content as empty so the repair path engages
+    # (same guard as call_llm's `raw.text or ""`). Strip markdown code
+    # fences if present.
+    blocks = body.get("content") or []
+    raw = blocks[0].get("text", "") if blocks and isinstance(blocks[0], dict) else ""
     raw = raw.strip()
     if raw.startswith("```"):
         raw = raw.split("\n", 1)[-1]
@@ -359,12 +410,9 @@ async def _call_litellm(
 
     Uses ``litellm.acompletion`` (not ``litellm.completion``) so this
     path doesn't block the event loop either, matching the direct-HTTP
-    providers above (Phase 8).
+    providers above.
     """
     import litellm  # optional dependency — only imported when this path is taken
-
-    json_schema = output_model.model_json_schema()
-    _ensure_strict(json_schema)
 
     response = await litellm.acompletion(
         model=config.model,
@@ -372,17 +420,13 @@ async def _call_litellm(
             {"role": "system", "content": config.system_prompt},
             {"role": "user", "content": user_message},
         ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": output_model.__name__,
-                "strict": True,
-                "schema": json_schema,
-            },
-        },
+        response_format=_strict_response_format(output_model),
         temperature=config.temperature,
         api_key=config.api_key,
-        api_base=config.base_url,
+        # litellm's api_base is a BASE (it appends the provider path
+        # itself) — strip a full-endpoint value back to its base so the
+        # same config field means the same thing on every backend.
+        api_base=_strip_endpoint_path(config.base_url) if config.base_url else None,
         max_tokens=config.max_tokens,
         timeout=config.timeout_s,
     )

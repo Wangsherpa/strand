@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from abc import ABC
 from contextlib import contextmanager
-from typing import Any, ClassVar, Dict, List, Optional, Tuple
+from typing import Any, ClassVar, Dict, List, Optional, Tuple, Type
 
 from strand.core.context import TaskContext
-from strand.core.listener import WorkflowListener
+from strand.core.listener import WorkflowListener, notify_listeners
 from strand.core.node import Node
 from strand.core.router import BaseRouter
 from strand.core.run_context import RunContext
@@ -158,29 +159,47 @@ class Workflow(ABC):
         1. Creates (or reuses) a ``TaskContext``.
         2. Parses *event* through ``event_schema`` when starting fresh.
         3. Installs this workflow's ``RunContext`` (inheriting identity
-           from the ancestor's when nested), and restores the
-           ancestor's afterward.
-        4. Delegates each node to :meth:`_run_node`, then asks
-           :meth:`_next_key` where to go — following ``process()`` on
-           regular nodes and ``route()`` on routers.
+           and listeners from a still-running ancestor's when nested),
+           marks it finished on the way out, and restores the
+           ancestor's afterwards.
+        4. Delegates each node to :meth:`_run_node` and each router to
+           :meth:`_handle_router`, then asks :meth:`_next_key` where to
+           go — following ``process()`` on regular nodes and
+           ``route()`` on routers, and jumping along
+           ``NodeConfig.on_error`` when a node fails.
         5. Notifies listeners of workflow start/end around the whole
            traversal, regardless of whether it completes or raises.
         """
         # --- context setup ---------------------------------------------------
+        parent_run: Optional[RunContext] = None
         if existing_context is not None:
             task_context = existing_context
-            task_context.should_stop = False
+            parent_run = task_context._run_context
+            if parent_run is not None and parent_run.finished:
+                # The caller passed a context left over from a previous,
+                # completed run ("resume"). That finished run's identity
+                # and listeners must NOT be inherited — a new top-level
+                # execution mints its own execution_id (see
+                # RunContext.child_of).
+                parent_run = None
+            if parent_run is None:
+                # Fresh or resumed run: a new traversal starts
+                # un-stopped, even if the resumed context carries a
+                # should_stop from its previous traversal. Nested
+                # children must NOT touch this — a parent that signalled
+                # stop before running a child still expects the stop to
+                # be honoured once the child returns.
+                task_context.should_stop = False
         else:
             task_context = TaskContext(event=event)
             task_context.event = self._schema.event_schema(**event)
 
-        # Install this workflow's RunContext. When nested (existing_context
-        # was passed in and already carries an ancestor's RunContext),
-        # inherit its execution_id/started_at/listeners so every nested
-        # workflow's node executions land in the same overall trace, while
-        # this workflow still traverses its own graph via its own
-        # node_configs. Restored to the ancestor's below, on the way out.
-        parent_run = task_context._run_context
+        # Install this workflow's RunContext. When nested (a still-running
+        # ancestor's RunContext is installed), inherit its
+        # execution_id/started_at/listeners so every nested workflow's node
+        # executions land in the same overall trace, while this workflow
+        # still traverses its own graph via its own node_configs. Restored
+        # to the ancestor's below, on the way out.
         task_context._run_context = RunContext.child_of(
             parent_run,
             workflow_name=type(self).__name__,
@@ -188,9 +207,10 @@ class Workflow(ABC):
             node_configs=self._node_configs,
             own_listeners=self._listeners,
         )
+        this_run = task_context._run_context
 
         started = time.monotonic()
-        self._notify(task_context, "on_workflow_start", task_context.event)
+        await self._notify(task_context, "on_workflow_start", task_context.event)
 
         error: Optional[BaseException] = None
         try:
@@ -202,36 +222,36 @@ class Workflow(ABC):
                     logger.info("Workflow stop-signalled — halting execution.")
                     break
 
-                task_context._run_context.traversal.append(current_key)
+                nc = self._node_configs.get(current_key)
+                if nc is not None and nc.is_router:
+                    current_key = await self._handle_router(current_key, task_context)
+                    continue
+
                 task_context, error_route = await self._run_node(current_key, task_context)
                 if error_route is not None:
                     current_key = error_route
                 else:
-                    current_key = await self._next_key(current_key, task_context)
+                    current_key = self._next_key(current_key)
         except BaseException as exc:  # noqa: BLE001 — re-raised unchanged below
             error = exc
             raise
         finally:
             duration_ms = (time.monotonic() - started) * 1000
-            self._notify(
+            await self._notify(
                 task_context,
                 "on_workflow_end",
                 "error" if error is not None else "completed",
                 duration_ms,
                 error,
             )
+            this_run.finished = True
             # Only restore an ancestor's RunContext — a nested child
             # returning control to its parent's still-running loop (or
             # unwinding through it on error). At the top level
-            # (parent_run is None) there is nothing left to run against
-            # this context, so this workflow's own RunContext is left
-            # installed: the caller can still read
-            # execution_id/workflow_version off the result. This
-            # finally block also fixes a bug present since Phase 4: the
-            # restore previously only ran on the non-exception path, so
-            # a node that caught an exception from a nested child and
-            # continued would keep running with the child's RunContext
-            # (wrong node_configs/workflow_version) installed.
+            # (parent_run is None) this workflow's own RunContext is
+            # left installed, marked finished: the caller can still read
+            # execution_id/workflow_version off the result, while a
+            # later run on the same context starts a fresh execution.
             if parent_run is not None:
                 task_context._run_context = parent_run
 
@@ -244,19 +264,27 @@ class Workflow(ABC):
     async def _run_node(
         self, current_key: str, task_context: TaskContext
     ) -> Tuple[TaskContext, Optional[str]]:
-        """Instantiate, run, and clean up the node at *current_key*,
-        retrying and enforcing a timeout per ``NodeConfig.retry`` /
-        ``NodeConfig.timeout_s`` when either is set.
+        """Instantiate, run, and clean up the (non-router) node at
+        *current_key*, retrying and enforcing a timeout per
+        ``NodeConfig.retry`` / ``NodeConfig.timeout_s`` when either is
+        set. Routers never reach this method — the main loop routes
+        them through :meth:`_handle_router` instead.
 
-        Routers are skipped here — they have no ``process()`` to run;
-        routing itself is handled separately by :meth:`_next_key` /
-        :meth:`_handle_router`, once this method returns. They still
-        get on_node_start/on_node_end notifications (``node_kind ==
-        "router"`` is the signal that the actual decision is reported
-        separately via ``on_route``), for symmetric "which step ran"
-        coverage across every key visited. Routers are never retried
-        or timed out — ``route()`` is synchronous, deterministic
-        rule evaluation, not I/O.
+        ``asyncio.CancelledError`` is re-raised immediately: never
+        retried, never routed to ``on_error`` — cancellation means the
+        caller wants the run to stop. (It is a ``BaseException``, so
+        ``RetryPolicy``'s default never matches it.)
+
+        ``cleanup()`` always runs exactly once per attempt, BEFORE the
+        retry/error decision — a raising teardown can therefore neither
+        skip a retry nor skip ``on_error`` routing, and a cleanup
+        failure while the node itself already failed is logged without
+        masking the node's own error.
+
+        A ``process()`` that returns a *different* ``TaskContext``
+        instance (e.g. a rebuilt one) has the engine's ``RunContext``
+        carried over to it; returning ``None`` is accepted as "kept the
+        context in place"; returning anything else is a ``TypeError``.
 
         Returns the (possibly updated) context and, when this node's
         failure was routed via ``NodeConfig.on_error`` instead of
@@ -278,152 +306,279 @@ class Workflow(ABC):
             node_instance: Optional[Node] = None
             error: Optional[BaseException] = None
 
-            self._notify(task_context, "on_node_start", current_key, node_kind, attempt)
+            await self._notify(task_context, "on_node_start", current_key, node_kind, attempt)
             started = time.monotonic()
 
             try:
                 with self._node_context(current_key):
-                    if not issubclass(node_class, BaseRouter):
-                        node_instance = node_class(
-                            task_context=task_context,
-                            node_id=current_key,
+                    node_instance = self._instantiate(node_class, task_context, current_key)
+                    coro = node_instance.process(task_context)
+                    if timeout_s is not None:
+                        result = await asyncio.wait_for(coro, timeout_s)
+                    else:
+                        result = await coro
+                    if isinstance(result, TaskContext):
+                        if result is not task_context:
+                            # A node may return a fresh/rebuilt context —
+                            # carry the engine's bookkeeping over to it
+                            # (execution identity, listeners, node
+                            # configs) so the run continues on the
+                            # returned object.
+                            result._run_context = task_context._run_context
+                        task_context = result
+                    elif result is not None:
+                        error = TypeError(
+                            f"Node '{current_key}' process() returned "
+                            f"{type(result).__name__}; expected the TaskContext "
+                            f"(or None to keep the current one)."
                         )
-                        coro = node_instance.process(task_context)
-                        if timeout_s is not None:
-                            task_context = await asyncio.wait_for(coro, timeout_s)
-                        else:
-                            task_context = await coro
+                    # result is None: the node kept/mutated the context in
+                    # place and returned nothing — accepted.
+            except asyncio.CancelledError:
+                raise
             except BaseException as exc:  # noqa: BLE001 — re-raised unless retrying
                 error = exc
             finally:
                 duration_ms = (time.monotonic() - started) * 1000
-                if error is not None:
-                    will_retry = retry_policy is not None and retry_policy.should_retry(
-                        error, attempt
-                    )
-                    self._notify(
-                        task_context,
-                        "on_node_error",
-                        current_key,
-                        node_kind,
-                        error,
-                        attempt,
-                        will_retry,
-                    )
-                else:
-                    output = task_context.nodes.get(current_key)
-                    self._notify(
-                        task_context,
-                        "on_node_end",
-                        current_key,
-                        node_kind,
-                        "completed",
-                        duration_ms,
-                        output,
-                        attempt,
-                    )
                 if node_instance is not None:
-                    await node_instance.cleanup()
+                    try:
+                        await node_instance.cleanup()
+                    except asyncio.CancelledError:
+                        raise
+                    except BaseException as cleanup_exc:
+                        if error is None:
+                            error = cleanup_exc
+                        else:
+                            logger.exception(
+                                "Node '%s' cleanup() raised after the node itself "
+                                "failed — keeping the node's own error.",
+                                current_key,
+                            )
 
-            if error is None:
-                return task_context, None
-            if not will_retry:
+            if error is not None:
+                will_retry = (
+                    retry_policy is not None
+                    and retry_policy.should_retry(error, attempt)
+                )
+                await self._notify(
+                    task_context,
+                    "on_node_error",
+                    current_key,
+                    node_kind,
+                    error,
+                    attempt,
+                    will_retry,
+                    duration_ms,
+                )
+                if will_retry:
+                    await _sleep(retry_policy.backoff_seconds(attempt))
+                    attempt += 1
+                    continue
                 if nc is not None and nc.on_error is not None:
                     task_context.errors[current_key] = f"{type(error).__name__}: {error}"
                     return task_context, nc.on_error
                 raise error
 
-            await _sleep(retry_policy.backoff_seconds(attempt))
-            attempt += 1
-
-    # ------------------------------------------------------------------
-    # Graph traversal
-    # ------------------------------------------------------------------
-
-    async def _next_key(
-        self, current_key: str, task_context: TaskContext
-    ) -> Optional[str]:
-        """Return the next node key, or ``None`` if this is a terminal node."""
-        nc = self._node_configs.get(current_key)
-        if nc is None or not nc.connections:
-            return None
-
-        if nc.is_router:
-            router_cls = self._registry[current_key]
-            router: BaseRouter = router_cls(
-                task_context=task_context, node_id=current_key
+            output = task_context.nodes.get(current_key)
+            await self._notify(
+                task_context,
+                "on_node_end",
+                current_key,
+                node_kind,
+                "completed",
+                duration_ms,
+                output,
+                attempt,
             )
-            return await self._handle_router(router, task_context)
+            return task_context, None
 
-        # Linear flow — follow the first (and only) connection.
-        return nc.connections[0]
+    # ------------------------------------------------------------------
+    # Router execution
+    # ------------------------------------------------------------------
 
     async def _handle_router(
-        self, router: BaseRouter, task_context: TaskContext
+        self, current_key: str, task_context: TaskContext
     ) -> Optional[str]:
-        """Delegate to the router and return the chosen next key."""
-        chosen_next = router.route(task_context)
+        """Instantiate the router at *current_key*, route, and report.
 
-        if router.last_matched_rule is not None:
+        Routers run outside :meth:`_run_node`: routing is synchronous,
+        deterministic rule evaluation — never retried or timed out. A
+        raising rule IS reported as ``on_node_error`` (not, as before,
+        as a completed node with the error attributed to nothing), and
+        ``on_route`` carries the decision either way.
+        """
+        router_cls = self._registry[current_key]
+        router: BaseRouter = self._instantiate(router_cls, task_context, current_key)
+
+        chosen_next: Optional[str] = None
+        error: Optional[BaseException] = None
+        started = time.monotonic()
+
+        await self._notify(task_context, "on_node_start", current_key, router.kind, 1)
+        try:
+            chosen_next = router.route(task_context)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001 — re-raised after notifying
+            error = exc
+        finally:
+            try:
+                await router.cleanup()
+            except asyncio.CancelledError:
+                raise
+            except BaseException as cleanup_exc:
+                if error is None:
+                    error = cleanup_exc
+                else:
+                    logger.exception(
+                        "Router '%s' cleanup() raised after route() failed — "
+                        "keeping the route error.",
+                        current_key,
+                    )
+
+        duration_ms = (time.monotonic() - started) * 1000
+        if error is not None:
+            await self._notify(
+                task_context,
+                "on_node_error",
+                current_key,
+                router.kind,
+                error,
+                1,
+                False,
+                duration_ms,
+            )
+            raise error
+
+        output = task_context.nodes.get(current_key)
+        await self._notify(
+            task_context,
+            "on_node_end",
+            current_key,
+            router.kind,
+            "completed",
+            duration_ms,
+            output,
+            1,
+        )
+
+        matched_rule = getattr(router, "last_matched_rule", None)
+        if matched_rule is not None:
             reason = "matched_rule"
         elif chosen_next is not None:
             reason = "fallback"
         else:
             reason = "no_match_no_fallback"
 
-        self._notify(
+        await self._notify(
             task_context,
             "on_route",
             router.node_name,
             chosen_next,
-            router.last_matched_rule,
+            matched_rule,
             reason,
         )
         return chosen_next
 
     # ------------------------------------------------------------------
+    # Graph traversal
+    # ------------------------------------------------------------------
+
+    def _next_key(self, current_key: str) -> Optional[str]:
+        """Return the next node key, or ``None`` if this is a terminal node.
+
+        Only non-router nodes reach this — routers are dispatched from
+        the main loop via :meth:`_handle_router`. The validator
+        guarantees a non-router node has at most one connection.
+        """
+        nc = self._node_configs.get(current_key)
+        if nc is None or not nc.connections:
+            return None
+        return nc.connections[0]
+
+    # ------------------------------------------------------------------
     # Listener dispatch
     # ------------------------------------------------------------------
 
-    def _notify(self, task_context: TaskContext, method_name: str, *args: Any) -> None:
+    async def _notify(self, task_context: TaskContext, method_name: str, *args: Any) -> None:
         """Call *method_name* on every listener registered for this run.
 
-        A listener raising is logged and swallowed here — never
-        allowed to affect workflow execution. This is the one place
-        that guarantee is enforced; every call site in this module
-        relies on it rather than re-implementing it.
+        Delegates to ``strand.core.listener.notify_listeners`` — the one
+        place the "a raising listener is logged and swallowed, never
+        allowed to affect workflow execution" guarantee is enforced.
+        Hooks may be sync or async; coroutine hooks are awaited.
         """
-        run = task_context._run_context
-        if run is None:
-            return
-        for listener in run.listeners:
-            method = getattr(listener, method_name, None)
-            if method is None:
-                continue
-            try:
-                method(run, *args)
-            except Exception:
-                logger.exception(
-                    "Listener %r raised in %s() — ignoring.", listener, method_name
-                )
+        await notify_listeners(task_context._run_context, method_name, *args)
 
     # ------------------------------------------------------------------
     # Initialisation helpers
     # ------------------------------------------------------------------
+
+    def _instantiate(
+        self,
+        node_class: Type[Node],
+        task_context: TaskContext,
+        node_id: str,
+    ) -> Node:
+        """Instantiate *node_class* for *node_id*, tolerating both eras
+        of constructor style.
+
+        Nodes written against the current convention accept
+        ``task_context=``/``node_id=`` keyword arguments (by inheriting
+        ``Node.__init__`` or declaring their own). Subclasses written
+        against the earlier engine were called with no arguments and
+        managed their own state — for those, instantiate bare and assign
+        ``task_context``/``_node_id`` directly, so existing subclasses
+        keep working unmodified.
+        """
+        try:
+            sig = inspect.signature(node_class.__init__)
+        except (TypeError, ValueError):
+            sig = None
+        if sig is not None:
+            accepts_kwargs = any(
+                param.kind is inspect.Parameter.VAR_KEYWORD
+                for param in sig.parameters.values()
+            )
+            accepts_named = (
+                "task_context" in sig.parameters and "node_id" in sig.parameters
+            )
+            if accepts_kwargs or accepts_named:
+                return node_class(task_context=task_context, node_id=node_id)
+        instance = node_class()
+        instance.task_context = task_context
+        instance._node_id = node_id
+        return instance
 
     def _build_node_configs(self) -> Dict[str, NodeConfig]:
         """Build a dictionary of every node key → ``NodeConfig``.
 
         Nodes referenced in ``connections`` that do not have an explicit
         ``NodeConfig`` entry get an implicit one with no connections
-        (i.e. they become terminal nodes).
+        (i.e. they become terminal nodes). A ``BaseRouter`` referenced
+        this way is rejected: routers need an explicit config
+        (``is_router=True`` plus their own connections), and an implicit
+        one would silently turn routing into a dead end.
         """
         configs: Dict[str, NodeConfig] = {}
+        explicit = {nc.node for nc in self._schema.nodes}
         for nc in self._schema.nodes:
             configs[nc.node] = nc
             for connected_key in nc.connections:
-                if connected_key not in configs:
-                    configs[connected_key] = NodeConfig(node=connected_key)
+                if connected_key in configs or connected_key in explicit:
+                    # Already configured — either explicitly (wherever it
+                    # appears in the nodes list) or implicitly (created
+                    # below by an earlier reference).
+                    continue
+                node_class = self._schema.registry.get(connected_key)
+                if node_class is not None and issubclass(node_class, BaseRouter):
+                    raise ValueError(
+                        f"Node '{connected_key}' is referenced as a connection "
+                        f"but has no explicit NodeConfig, and its registered "
+                        f"class is a BaseRouter — routers need an explicit "
+                        f"config (is_router=True plus their own connections)."
+                    )
+                configs[connected_key] = NodeConfig(node=connected_key)
         return configs
 
     # ------------------------------------------------------------------

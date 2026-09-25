@@ -36,6 +36,8 @@ class NodeConfig(BaseModel):
             via ``Node.get_error(node_id)``.
     """
 
+    model_config = {"extra": "forbid"}
+
     node: str
     connections: List[str] = Field(default_factory=list)
     is_router: bool = False
@@ -65,7 +67,7 @@ class WorkflowSchema(BaseModel):
         registry: Mapping from string keys to ``Node`` subclasses.
     """
 
-    model_config = {"arbitrary_types_allowed": True}
+    model_config = {"arbitrary_types_allowed": True, "extra": "forbid"}
 
     description: Optional[str] = None
     version: Optional[str] = None
@@ -82,7 +84,8 @@ class WorkflowSchema(BaseModel):
         """Return a Mermaid.js ``flowchart TD`` diagram of the workflow.
 
         Paste the output into any Markdown viewer that supports Mermaid
-        (GitHub, Notion, Obsidian, etc.).
+        (GitHub, Notion, Obsidian, etc.). ``on_error`` edges render as
+        dashed ``-. on_error .->`` arrows.
         """
         lines = ["flowchart TD"]
         if self.version:
@@ -95,6 +98,9 @@ class WorkflowSchema(BaseModel):
             for conn in nc.connections:
                 arrow = " -- decision --> " if nc.is_router else " --> "
                 lines.append(f"    {nc.node}{arrow}{conn}")
+        for nc in self.nodes:
+            if nc.on_error is not None:
+                lines.append(f"    {nc.node} -. on_error .-> {nc.on_error}")
         if self.start:
             lines.append(f"    start([START]) --> {self.start}")
         return "\n".join(lines) + "\n"
@@ -137,6 +143,12 @@ class WorkflowSchema(BaseModel):
             for conn in nc.connections:
                 label = "decision" if nc.is_router else ""
                 lines.append(f'    {nc.node} -> {conn} [label="{label}"];')
+        for nc in self.nodes:
+            if nc.on_error is not None:
+                lines.append(
+                    f'    {nc.node} -> {nc.on_error} '
+                    f'[label="on_error", style=dashed, color=red];'
+                )
         if self.start:
             lines.append(f'    start [label="START", shape=oval];')
             lines.append(f"    start -> {self.start};")
