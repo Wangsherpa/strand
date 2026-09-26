@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Type
+from typing import List, Literal, Optional, Type
 
 from pydantic import BaseModel, Field
 
@@ -34,6 +34,20 @@ class NodeConfig(BaseModel):
             before this field existed. The failing node's own output
             is never written; the target node can inspect what failed
             via ``Node.get_error(node_id)``.
+        parallel: Registry keys executed CONCURRENTLY when execution
+            reaches this node (a fan-out group). Each branch is a full
+            sequential sub-walk of the graph — including routers and
+            nested groups — sharing this ``TaskContext``; branch nodes
+            must not read each other's outputs (a race). The group's
+            ``connections`` (at most one) is its continuation: the join
+            node that runs once ALL branches have finished.
+        error_policy: How a parallel group handles branch failures —
+            ``"fail_fast"`` (the default): the first branch failure
+            cancels the remaining branches and fails the group;
+            ``"collect"``: every branch runs to completion and each
+            failure is recorded in ``TaskContext.errors[branch]`` for
+            the join node to inspect. Only meaningful when ``parallel``
+            is set (the validator rejects it otherwise).
     """
 
     model_config = {"extra": "forbid"}
@@ -45,6 +59,8 @@ class NodeConfig(BaseModel):
     retry: Optional[RetryPolicy] = None
     timeout_s: Optional[float] = None
     on_error: Optional[str] = None
+    parallel: List[str] = Field(default_factory=list)
+    error_policy: Literal["fail_fast", "collect"] = "fail_fast"
 
 
 class WorkflowSchema(BaseModel):
@@ -101,6 +117,9 @@ class WorkflowSchema(BaseModel):
         for nc in self.nodes:
             if nc.on_error is not None:
                 lines.append(f"    {nc.node} -. on_error .-> {nc.on_error}")
+        for nc in self.nodes:
+            for branch in nc.parallel:
+                lines.append(f"    {nc.node} == parallel ==> {branch}")
         if self.start:
             lines.append(f"    start([START]) --> {self.start}")
         return "\n".join(lines) + "\n"
@@ -149,6 +168,9 @@ class WorkflowSchema(BaseModel):
                     f'    {nc.node} -> {nc.on_error} '
                     f'[label="on_error", style=dashed, color=red];'
                 )
+        for nc in self.nodes:
+            for branch in nc.parallel:
+                lines.append(f'    {nc.node} -> {branch} [label="parallel", style=bold];')
         if self.start:
             lines.append(f'    start [label="START", shape=oval];')
             lines.append(f"    start -> {self.start};")
@@ -173,6 +195,8 @@ def _node_config_graph_dict(nc: NodeConfig) -> dict:
         "has_retry": nc.retry is not None,
         "retry_max_attempts": nc.retry.max_attempts if nc.retry else None,
         "timeout_s": nc.timeout_s,
+        "parallel": list(nc.parallel),
+        "error_policy": nc.error_policy,
     }
 
 

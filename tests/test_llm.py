@@ -395,3 +395,47 @@ def test_strict_schema_is_memoized_per_model():
     assert first is second
     assert client_mod._strict_schema.cache_info().hits == 1
     assert first["additionalProperties"] is False
+
+
+# ---------------------------------------------------------------------------
+# Strict-mode schema requirements (OpenAI 400s otherwise)
+# ---------------------------------------------------------------------------
+
+
+class _WithOptionals(BaseModel):
+    name: str
+    note: str | None = None
+    count: int = 3
+
+    class Nested(BaseModel):
+        label: str
+        optional_flag: bool = False
+
+    nested: Nested | None = None
+
+
+def test_strict_schema_marks_all_properties_required():
+    import strand.llm.client as client_mod
+
+    schema = client_mod._strict_schema(_WithOptionals)
+    assert schema["required"] == sorted(["name", "note", "count", "nested"])
+
+
+def test_strict_schema_drops_defaults_and_forbids_extra_at_every_level():
+    import strand.llm.client as client_mod
+
+    schema = client_mod._strict_schema(_WithOptionals)
+
+    def walk(node):
+        assert "default" not in node, f"default leaked: {node}"
+        if node.get("type") == "object":
+            assert node["additionalProperties"] is False
+            assert node["required"] == sorted(node.get("properties", {}))
+        for sub in node.get("properties", {}).values():
+            walk(sub)
+        for sub in node.get("anyOf", []):
+            walk(sub)
+        for sub in node.get("$defs", {}).values():
+            walk(sub)
+
+    walk(schema)

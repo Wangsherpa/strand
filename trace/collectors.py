@@ -165,6 +165,29 @@ class InMemoryCollector(WorkflowListener):
             )
         )
 
+    def on_parallel_end(
+        self,
+        run: RunContext,
+        node_id: str,
+        status: str,
+        duration_ms: float,
+        error: Optional[BaseException],
+    ) -> None:
+        record = self.records.get(run.execution_id)
+        if record is None:
+            return
+        fields = _error_fields(error)
+        record.spans.append(
+            NodeSpan(
+                node_id=node_id,
+                node_kind="parallel",
+                status=status,
+                duration_ms=duration_ms,
+                error_type=fields["error_type"],
+                error_message=fields["error_message"],
+            )
+        )
+
 
 def _best_effort_payload(value: Any) -> Any:
     """A pydantic model dumps cleanly to JSON; anything else falls
@@ -311,4 +334,31 @@ class JsonlWriter(WorkflowListener):
             chosen_next=chosen_next,
             matched_rule=matched_rule,
             reason=reason,
+        )
+
+    def on_parallel_start(
+        self, run: RunContext, node_id: str, branches: Any
+    ) -> None:
+        self._write(
+            "parallel_start",
+            execution_id=run.execution_id,
+            node_id=node_id,
+            branches=list(branches),
+        )
+
+    def on_parallel_end(
+        self,
+        run: RunContext,
+        node_id: str,
+        status: str,
+        duration_ms: float,
+        error: Optional[BaseException],
+    ) -> None:
+        self._write(
+            "parallel_end",
+            execution_id=run.execution_id,
+            node_id=node_id,
+            status=status,
+            duration_ms=duration_ms,
+            **_error_fields(error),
         )

@@ -27,6 +27,11 @@ class WorkflowValidator:
        name a key present in ``registry`` — the same guarantee
        ``connections`` already gets, since ``on_error`` is just
        another way execution can jump to a node.
+    6. **Parallel groups** — ``NodeConfig.parallel`` keys must exist in
+       the registry, must not duplicate each other or the group node
+       itself, must not be combined with ``is_router`` or multiple
+       ``connections`` (a group's single connection is its join), and
+       ``error_policy`` may only be set when ``parallel`` is.
 
     Raises ``ValueError`` on the first violation found.
     """
@@ -63,10 +68,11 @@ class WorkflowValidator:
                 raise ValueError(
                     f"Node '{nc.node}' is not in the registry."
                 )
-            unknown = set(nc.connections) - registry_keys
+            unknown = (set(nc.connections) | set(nc.parallel)) - registry_keys
             if unknown:
                 raise ValueError(
-                    f"Node '{nc.node}' references unknown connections: {unknown}"
+                    f"Node '{nc.node}' references unknown connection/parallel "
+                    f"keys: {unknown}"
                 )
 
     # ------------------------------------------------------------------
@@ -115,9 +121,11 @@ class WorkflowValidator:
     def _get_reachable_keys(self) -> Set[str]:
         """BFS from the start node to find all reachable keys.
 
-        Follows ``on_error`` targets alongside ``connections`` — a
-        dedicated error-handling node reachable only via ``on_error``
-        is still a legitimate part of the graph, not a dead one.
+        Follows ``on_error`` targets and ``parallel`` branches alongside
+        ``connections`` — a dedicated error-handling node reachable only
+        via ``on_error``, or a branch reachable only via its group's
+        ``parallel`` list, is still a legitimate part of the graph, not
+        a dead one.
         """
         reachable: Set[str] = set()
         queue = deque([self._schema.start])
@@ -131,6 +139,7 @@ class WorkflowValidator:
                     queue.extend(nc.connections)
                     if nc.on_error is not None:
                         queue.append(nc.on_error)
+                    queue.extend(nc.parallel)
 
         return reachable
 
@@ -145,6 +154,44 @@ class WorkflowValidator:
                     f"Node '{nc.node}' has multiple connections but is not "
                     f"marked as a router."
                 )
+            self._validate_parallel_group(nc)
+
+    def _validate_parallel_group(self, nc: NodeConfig) -> None:
+        """The structural rules for a fan-out group (check #6)."""
+        if not nc.parallel:
+            if nc.error_policy != "fail_fast":
+                raise ValueError(
+                    f"Node '{nc.node}' sets error_policy={nc.error_policy!r} "
+                    f"but has no parallel branches — error_policy only "
+                    f"applies to parallel groups."
+                )
+            return
+        if nc.is_router:
+            raise ValueError(
+                f"Node '{nc.node}' declares parallel branches but is marked "
+                f"is_router=True — a parallel group cannot also be a router."
+            )
+        if len(nc.connections) > 1:
+            raise ValueError(
+                f"Node '{nc.node}' declares parallel branches and multiple "
+                f"connections — a parallel group's connections are its single "
+                f"continuation (join) path."
+            )
+        if len(set(nc.parallel)) != len(nc.parallel):
+            raise ValueError(
+                f"Node '{nc.node}' lists a parallel branch more than once: "
+                f"{nc.parallel}"
+            )
+        if nc.node in nc.parallel:
+            raise ValueError(
+                f"Node '{nc.node}' lists itself as a parallel branch."
+            )
+        if nc.retry is not None:
+            raise ValueError(
+                f"Node '{nc.node}' declares a parallel group with retry — "
+                f"retry is not supported on parallel groups (branch nodes "
+                f"keep their own retry policies)."
+            )
 
     # ------------------------------------------------------------------
     # Router flag consistency
@@ -203,16 +250,21 @@ class WorkflowValidator:
 
     @staticmethod
     def _neighbors(nc: NodeConfig) -> List[str]:
-        """Every key execution can jump to from *nc*.
+        """Every key execution can move to from *nc*.
 
         ``on_error`` is just another way execution can move to a node,
         so cycle detection must follow it alongside ``connections`` — a
         node whose error handler (possibly itself) routes back into its
-        own path would otherwise loop forever at runtime.
+        own path would otherwise loop forever at runtime. Same for
+        ``parallel``: each branch is a path execution will walk, so a
+        branch chain leading back into its own group would recurse
+        forever.
         """
+        neighbors = list(nc.connections)
         if nc.on_error is not None:
-            return list(nc.connections) + [nc.on_error]
-        return list(nc.connections)
+            neighbors.append(nc.on_error)
+        neighbors.extend(nc.parallel)
+        return neighbors
 
     def _get_config(self, key: str) -> Optional[NodeConfig]:
         """Return the ``NodeConfig`` for *key*, or ``None``."""

@@ -187,7 +187,7 @@ class SentimentRouter(BaseRouter):
 | `TaskContext` | Shared state bus flowing through every node |
 | `BaseRouter` | Conditional branching node |
 | `RouterNode` | Individual routing rule |
-| `NodeConfig` | Declares one node's connections and routing flag |
+| `NodeConfig` | Declares one node's connections, routing flag, retry/timeout/on_error, and parallel group |
 | `WorkflowSchema` | Full graph definition (nodes + edges + registry) |
 | `WorkflowValidator` | DAG validation — cycle detection, reachability, connection rules |
 | `Workflow` | Execution engine — `run()` / `run_async()` |
@@ -309,6 +309,34 @@ the TOTAL provider calls, repair attempts included. When a node's `NodeConfig.re
 is set, the engine owns retries for that node and the LLM layer's transport retry
 is disabled for its calls — the two layers never multiply.
 
+### Parallel groups (fan-out / fan-in)
+
+List registry keys in `parallel` to run them **concurrently** when execution
+reaches that node; the node's single `connections` entry is the join that runs
+once all branches finish:
+
+```python
+NodeConfig(
+    node="extract_all",
+    parallel=["vendor", "line_items", "totals"],   # run concurrently
+    connections=["validate"],                       # the join
+    error_policy="fail_fast",
+)
+```
+
+- Each branch is a full sequential sub-walk of the graph (routers and nested
+  groups included), sharing one `TaskContext`. Branch nodes may write their own
+  outputs but must not read siblings' — the join reads everything via
+  `Node.get_output()` / `Node.get_error()`.
+- `error_policy="fail_fast"` (default): the first branch failure cancels the
+  remaining branches and fails the group — routing via the group's `on_error`
+  if set. `"collect"`: every branch runs to completion and each failure is
+  recorded in `ctx.errors[branch]` so the join can salvage partial results.
+- The group node itself is never retried (branch nodes keep their own `retry`
+  policies); `timeout_s` bounds the whole group. Cancellation always propagates.
+- Listeners receive `on_parallel_start` / `on_parallel_end`; branch nodes emit
+  their usual `on_node_*` events.
+
 ---
 
 ## Observability
@@ -319,6 +347,7 @@ Pass `WorkflowListener` instances to `Workflow(listeners=[...])` to observe runs
 - `on_node_start` / `on_node_end` / `on_node_error` — per node attempt, with real
   attempt numbers, retry decisions, and durations
 - `on_route` — every router decision
+- `on_parallel_start` / `on_parallel_end` — around every fan-out group
 
 Hooks may be sync or async; a raising listener is logged and never affects the
 run. Nested workflows inherit the outermost listeners under one `execution_id`.
@@ -360,6 +389,8 @@ strand/
         __init__.py          #   InMemoryCollector, JsonlWriter, ExecutionRecord
         collectors.py        #   the two reference listeners
         models.py            #   ExecutionRecord, NodeSpan, RouteDecision
+
+    tests/                   # pytest regression suite (dev dependency group)
 ```
 
 | Module | LOC | Dependencies |
@@ -431,7 +462,7 @@ Pydantic is the only hard dependency of `strand.core`. It provides:
 
 ### Why async?
 
-All `Node.process()` methods are `async`. This enables I/O-bound nodes without blocking, future support for concurrent execution, and compatibility with async web frameworks.
+All `Node.process()` methods are `async`. This enables I/O-bound nodes without blocking, parallel groups running their branches concurrently, and compatibility with async web frameworks.
 
 ### Why separate `strand.core` and `strand.llm`?
 

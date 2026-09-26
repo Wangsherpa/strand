@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from strand.core.run_context import RunContext
 
@@ -169,4 +169,31 @@ class WorkflowListener:
         ``"no_match_no_fallback"``. *matched_rule* is the matching
         ``RouterNode`` rule's ``node_name`` when
         ``reason == "matched_rule"``, else ``None``.
+        """
+
+    def on_parallel_start(
+        self, run: RunContext, node_id: str, branches: List[str]
+    ) -> None:
+        """Called before a parallel group fans out.
+
+        *branches* are the registry keys that will run concurrently —
+        each branch's own ``on_node_*`` events report its progress.
+        """
+
+    def on_parallel_end(
+        self,
+        run: RunContext,
+        node_id: str,
+        status: str,
+        duration_ms: float,
+        error: Optional[BaseException],
+    ) -> None:
+        """Called once when a parallel group finishes.
+
+        *status* is ``"completed"`` when every branch succeeded — or,
+        under ``error_policy="collect"``, when the group itself finished
+        (branch failures are recorded in ``TaskContext.errors`` and do
+        not fail the group) — and ``"error"`` when a branch failed
+        (fail_fast) or the group timed out; *error* is the failure, if
+        any.
         """

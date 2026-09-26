@@ -197,17 +197,24 @@ async def call_llm(
 
 
 def _ensure_strict(schema: dict) -> None:
-    """Add ``additionalProperties: False`` to every object node
-    (required by OpenAI/LiteLLM strict mode) — including nested models
-    under ``$defs``.
+    """Prepare a pydantic JSON schema for OpenAI/LiteLLM strict mode.
 
-    Pydantic v2 emits nested BaseModel fields as ``$ref`` pointers into
-    a top-level ``$defs`` section rather than inlining them, so a walk
-    that only follows ``properties``/``anyOf`` never reaches those
-    definitions. Fixed here by also recursing into ``$defs``.
+    Strict mode demands three things pydantic does not emit:
+
+    * ``additionalProperties: False`` at every object level,
+    * every property listed in ``required`` — pydantic omits fields
+      with defaults, and OpenAI rejects the schema with a 400 when any
+      property is missing from the list,
+    * no ``default`` values anywhere.
+
+    Nested models live under ``$defs`` as ``$ref`` pointers, so the walk
+    also recurses into ``$defs`` — following only ``properties``/
+    ``anyOf`` never reaches those definitions.
     """
+    schema.pop("default", None)
     if schema.get("type") == "object":
         schema["additionalProperties"] = False
+        schema["required"] = sorted(schema.get("properties", {}))
         for prop in schema.get("properties", {}).values():
             _ensure_strict(prop)
     if "anyOf" in schema:

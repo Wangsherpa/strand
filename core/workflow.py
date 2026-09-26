@@ -162,11 +162,9 @@ class Workflow(ABC):
            and listeners from a still-running ancestor's when nested),
            marks it finished on the way out, and restores the
            ancestor's afterwards.
-        4. Delegates each node to :meth:`_run_node` and each router to
-           :meth:`_handle_router`, then asks :meth:`_next_key` where to
-           go — following ``process()`` on regular nodes and
-           ``route()`` on routers, and jumping along
-           ``NodeConfig.on_error`` when a node fails.
+        4. Walks the graph via :meth:`_walk`/:meth:`_step` — following
+           ``process()`` on regular nodes, ``route()`` on routers, and
+           ``NodeConfig.on_error`` jumps when a node fails.
         5. Notifies listeners of workflow start/end around the whole
            traversal, regardless of whether it completes or raises.
         """
@@ -214,24 +212,7 @@ class Workflow(ABC):
 
         error: Optional[BaseException] = None
         try:
-            current_key: Optional[str] = self._schema.start
-
-            # --- main loop ---------------------------------------------------
-            while current_key is not None:
-                if task_context.should_stop:
-                    logger.info("Workflow stop-signalled — halting execution.")
-                    break
-
-                nc = self._node_configs.get(current_key)
-                if nc is not None and nc.is_router:
-                    current_key = await self._handle_router(current_key, task_context)
-                    continue
-
-                task_context, error_route = await self._run_node(current_key, task_context)
-                if error_route is not None:
-                    current_key = error_route
-                else:
-                    current_key = self._next_key(current_key)
+            await self._walk(self._schema.start, task_context)
         except BaseException as exc:  # noqa: BLE001 — re-raised unchanged below
             error = exc
             raise
@@ -481,8 +462,170 @@ class Workflow(ABC):
         return chosen_next
 
     # ------------------------------------------------------------------
+    # Parallel execution
+    # ------------------------------------------------------------------
+
+    async def _run_parallel(
+        self, nc: NodeConfig, task_context: TaskContext
+    ) -> Optional[str]:
+        """Run the fan-out group declared by *nc*.
+
+        ``error_policy="fail_fast"`` (the default): the first branch
+        failure cancels the remaining branches (TaskGroup semantics)
+        and fails the group.
+        ``error_policy="collect"``: every branch runs to completion and
+        each branch failure is recorded in ``TaskContext.errors[branch]``
+        for the join node to inspect; the group itself completes.
+
+        A group-level failure — a fail_fast branch failure, or a group
+        timeout in either policy — routes via the group's ``on_error``
+        or propagates. Returns the error-route key when ``on_error``
+        handled it, else ``None`` (the caller continues along the
+        group's connections).
+
+        The group node itself is never retried — re-running it would
+        duplicate the side effects of branches that already completed;
+        branch nodes keep their own ``retry`` policies. ``timeout_s``
+        bounds the whole group. Cancellation is never collected: it
+        always propagates.
+        """
+        started = time.monotonic()
+        await self._notify(
+            task_context, "on_parallel_start", nc.node, list(nc.parallel)
+        )
+        error: Optional[BaseException] = None
+        try:
+            if nc.error_policy == "collect":
+                coro = self._run_parallel_collect(nc, task_context)
+            else:
+                coro = self._run_parallel_fail_fast(nc, task_context)
+            if nc.timeout_s is not None:
+                await asyncio.wait_for(coro, nc.timeout_s)
+            else:
+                await coro
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001 — re-raised after notifying
+            error = exc
+            # TaskGroup wraps a branch failure in an ExceptionGroup. With a
+            # single failure, surface the original exception so callers,
+            # listeners, and ctx.errors see the real error type and message
+            # instead of "ExceptionGroup: unhandled errors in a TaskGroup".
+            if isinstance(exc, ExceptionGroup) and len(exc.exceptions) == 1:
+                error = exc.exceptions[0]
+        finally:
+            duration_ms = (time.monotonic() - started) * 1000
+            await self._notify(
+                task_context,
+                "on_parallel_end",
+                nc.node,
+                "error" if error is not None else "completed",
+                duration_ms,
+                error,
+            )
+
+        if error is not None:
+            if nc.on_error is not None:
+                task_context.errors[nc.node] = f"{type(error).__name__}: {error}"
+                return nc.on_error
+            raise error
+        return None
+
+    async def _run_parallel_fail_fast(
+        self, nc: NodeConfig, task_context: TaskContext
+    ) -> None:
+        """The fail_fast fan-out: one concurrent walk per branch.
+
+        ``TaskGroup`` gives structured cancellation — when one branch
+        raises, the siblings are cancelled as the exception exits the
+        group.
+        """
+        async with asyncio.TaskGroup() as tg:
+            for branch in nc.parallel:
+                tg.create_task(self._walk(branch, task_context, branch=True))
+
+    async def _run_parallel_collect(
+        self, nc: NodeConfig, task_context: TaskContext
+    ) -> None:
+        """The collect fan-out: wait for every branch, keep the errors.
+
+        Each branch's ``Exception`` failure is recorded in
+        ``TaskContext.errors[branch]`` for the join node to inspect
+        (per-branch ``on_error`` handling happens inside the branch walk
+        first, so a branch that recovered records nothing). Cancellation
+        and non-``Exception`` failures are never collected — they
+        propagate.
+        """
+        results = await asyncio.gather(
+            *(self._walk(branch, task_context, branch=True) for branch in nc.parallel),
+            return_exceptions=True,
+        )
+        for branch, result in zip(nc.parallel, results):
+            if result is None:
+                continue
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, Exception):
+                task_context.errors[branch] = f"{type(result).__name__}: {result}"
+            else:  # a BaseException that is not an Exception
+                raise result
+
+    # ------------------------------------------------------------------
     # Graph traversal
     # ------------------------------------------------------------------
+
+    async def _walk(
+        self, start_key: str, task_context: TaskContext, *, branch: bool = False
+    ) -> None:
+        """Sequentially walk the graph from *start_key* until it ends.
+
+        One :meth:`_step` at a time, honouring ``should_stop`` before
+        every step. ``_execute`` drives the top-level walk with this;
+        each branch of a parallel group is driven by its own concurrent
+        invocation (``branch=True``) sharing the same context.
+        """
+        current_key: Optional[str] = start_key
+        while current_key is not None:
+            if task_context.should_stop:
+                logger.info("Workflow stop-signalled — halting execution.")
+                break
+            current_key = await self._step(current_key, task_context, branch=branch)
+
+    async def _step(
+        self, current_key: str, task_context: TaskContext, *, branch: bool = False
+    ) -> Optional[str]:
+        """Execute one traversal step at *current_key*; return the next key.
+
+        Routers route via :meth:`_handle_router`; parallel groups fan out
+        via :meth:`_run_parallel`; every other key runs as a node via
+        :meth:`_run_node` and continues along its (validator-guaranteed
+        single) connection — or along the key its ``NodeConfig.on_error``
+        routed to. ``None`` ends the walk.
+
+        When *branch* is True (walking inside a parallel group), the
+        context must stay the shared one: a node replacing the
+        TaskContext is rejected, because the join node reads the shared
+        context and a replacement would silently strand the branch's
+        outputs.
+        """
+        nc = self._node_configs.get(current_key)
+        if nc is not None and nc.is_router:
+            return await self._handle_router(current_key, task_context)
+        if nc is not None and nc.parallel:
+            error_route = await self._run_parallel(nc, task_context)
+            return error_route if error_route is not None else self._next_key(current_key)
+
+        new_context, error_route = await self._run_node(current_key, task_context)
+        if branch and new_context is not task_context:
+            raise RuntimeError(
+                f"Node '{current_key}' replaced the TaskContext inside a parallel "
+                f"branch — branch nodes must mutate the shared context in place "
+                f"(the join node reads it)."
+            )
+        task_context = new_context
+        if error_route is not None:
+            return error_route
+        return self._next_key(current_key)
 
     def _next_key(self, current_key: str) -> Optional[str]:
         """Return the next node key, or ``None`` if this is a terminal node.
@@ -553,32 +696,33 @@ class Workflow(ABC):
     def _build_node_configs(self) -> Dict[str, NodeConfig]:
         """Build a dictionary of every node key → ``NodeConfig``.
 
-        Nodes referenced in ``connections`` that do not have an explicit
-        ``NodeConfig`` entry get an implicit one with no connections
-        (i.e. they become terminal nodes). A ``BaseRouter`` referenced
-        this way is rejected: routers need an explicit config
-        (``is_router=True`` plus their own connections), and an implicit
-        one would silently turn routing into a dead end.
+        Nodes referenced in ``connections`` or ``parallel`` that do not
+        have an explicit ``NodeConfig`` entry get an implicit one with
+        no connections (i.e. they become terminal nodes). A
+        ``BaseRouter`` referenced this way is rejected: routers need an
+        explicit config (``is_router=True`` plus their own connections),
+        and an implicit one would silently turn routing into a dead end.
         """
         configs: Dict[str, NodeConfig] = {}
         explicit = {nc.node for nc in self._schema.nodes}
         for nc in self._schema.nodes:
             configs[nc.node] = nc
-            for connected_key in nc.connections:
-                if connected_key in configs or connected_key in explicit:
+            for referenced_key in [*nc.connections, *nc.parallel]:
+                if referenced_key in configs or referenced_key in explicit:
                     # Already configured — either explicitly (wherever it
                     # appears in the nodes list) or implicitly (created
                     # below by an earlier reference).
                     continue
-                node_class = self._schema.registry.get(connected_key)
+                node_class = self._schema.registry.get(referenced_key)
                 if node_class is not None and issubclass(node_class, BaseRouter):
                     raise ValueError(
-                        f"Node '{connected_key}' is referenced as a connection "
-                        f"but has no explicit NodeConfig, and its registered "
-                        f"class is a BaseRouter — routers need an explicit "
-                        f"config (is_router=True plus their own connections)."
+                        f"Node '{referenced_key}' is referenced as a connection "
+                        f"or parallel branch but has no explicit NodeConfig, and "
+                        f"its registered class is a BaseRouter — routers need an "
+                        f"explicit config (is_router=True plus their own "
+                        f"connections)."
                     )
-                configs[connected_key] = NodeConfig(node=connected_key)
+                configs[referenced_key] = NodeConfig(node=referenced_key)
         return configs
 
     # ------------------------------------------------------------------

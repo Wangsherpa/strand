@@ -65,6 +65,15 @@ class RecordingListener(WorkflowListener):
     def on_route(self, run, router_id, chosen_next, matched_rule, reason):
         self._rec("route", router_id=router_id, chosen_next=chosen_next, reason=reason)
 
+    def on_parallel_start(self, run, node_id, branches):
+        self._rec("parallel_start", node_id=node_id, branches=list(branches))
+
+    def on_parallel_end(self, run, node_id, status, duration_ms, error):
+        self._rec(
+            "parallel_end", node_id=node_id, status=status,
+            duration_ms=duration_ms, error=type(error).__name__ if error else None,
+        )
+
 
 class OkNode(Node):
     """A node that does nothing and returns the context."""
